@@ -1,0 +1,111 @@
+#! /usr/bin/env python
+"""
+An outbound firewall.  Inspired by the Little Snitch application for
+OS X.  Will log all outbound packets and will reject any packets that
+match any user-defined deny rules.
+
+For a more complete implementation with a better frontend, check out
+Leopard Firewall (lpfw).  Props to him/her/them for showing the
+technique of how to map packets to programs.
+
+NOTE: This program will only process packets that have been queued to
+user space by iptables.  When defining iptables rules, it is
+recommended to only send packets with state=new to avoid processing
+multiple packets for the same connection.
+"""
+
+import os, socket, nfqueue, syslog
+from glob import glob
+from scapy.all import *
+
+PROTOCOLS = {}
+PROTOCOLS[6]  = 'tcp'
+PROTOCOLS[17] = 'udp'
+
+snitchable = (6,17).__contains__
+
+
+def subshell(cmd):
+    """
+    Return output of given shell command.
+    """
+    from subprocess import Popen, PIPE
+    p = Popen(cmd, shell=True, stdout=PIPE, stderr=PIPE)
+    p.wait()
+    return p.stdout.read()
+
+
+def inode(pkt):
+    """
+    Yield inode number (as str) for any socket associated with given packet.
+
+    NOTE: Only works for TCP or UDP packets.
+    """
+    # Example from /proc/net/udp:
+    # sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops             
+    # 97: 0101010A:0035 00000000:0000 07 00000000:00000000 00:00000000 00000000   104        0 192851 2 ffff8803e96723c0 0
+    #
+    # Example from /proc/net/tcp:
+    # sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode                                                     
+    #  0: 0101010A:0035 00000000:0000 0A 00000000:00000000 00:00000000 00000000   104        0 192852 1 ffff8803e8969a00 300 0 0 2 -1                    
+    if not snitchable(pkt.proto):
+        return
+    with open('/proc/net/' + PROTOCOLS[pkt.proto]) as f:
+        pkt = pkt / (TCP() if pkt.proto == 6 else UDP())
+        f.readline() # Ignore header line.
+        for line in f.readlines():
+            fields = line.split()
+            if len(fields) < 10:
+                # TODO: How should we log that we've seen a bad line?
+                continue
+            inode = fields[9]
+            dst, dport = fields[2].split(':')
+            src, sport = fields[1].split(':')
+            dport = int(dport, 16)
+            sport = int(sport, 16)
+            # The addresses are in little-endian format.
+            dst = '.'.join(str(int(i, 16)) for i in (dst[6:8], dst[4:6], dst[2:4], dst[:2]))
+            src = '.'.join(str(int(i, 16)) for i in (src[6:8], src[4:6], src[2:4], src[:2]))
+            if dst == pkt.dst and dport == pkt.dport and inode != '0':
+                yield inode
+
+
+def program(inode):
+    """
+    Return program name using given inode.
+    """
+    if not inode:
+        return ''
+    # TODO: I'm worried this glob + readlink approach will be too slow for busier systems.
+    for path in glob('/proc/*/fd/*'):
+        # Looking for links of the form: <fileno> -> [socket:<inode>]
+        if os.path.exists(path) and inode in os.readlink(path):
+            pid = path.split('/')[2]
+            return os.readlink('/proc/%s/exe' % pid)
+    return ''
+
+
+def process_packet(dummy, payload):
+    """
+    Log packet's protocol, dst, dport, src, sport, & program via syslog.
+    If (program and/or dst and/or dport) matches any reject rules,
+    then reject the packet.  Otherwise, packet is accepted.
+    """
+    pkt = IP(payload.get_data())
+    for i in inode(pkt):
+        syslog.syslog(' | '.join(str(i) for i in (pkt.proto, pkt.dst, getattr(pkt, 'dport', ''), pkt.src, getattr(pkt, 'sport', ''), program(i))))
+        # TODO: See if we should reject.
+
+
+if __name__ == '__main__':
+    syslog.openlog('ov-snitch')
+    q = nfqueue.queue()
+    q.set_callback(process_packet)
+    q.fast_open(1, socket.AF_INET)
+    q.create_queue(0) 
+    try:
+        q.try_run()
+    except KeyboardInterrupt:
+        print "Exiting..." 
+    q.unbind(socket.AF_INET)
+    q.close()
