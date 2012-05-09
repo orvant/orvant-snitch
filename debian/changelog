@@ -1,0 +1,5 @@
+orvant-snitch (0.1.0-1) stable; urgency=low
+
+  * Logs outbound network activity of programs.
+
+ -- Orvant Maintainers <dev@orvant.com>  Sun, 08 Apr 2012 20:57:18 -0700

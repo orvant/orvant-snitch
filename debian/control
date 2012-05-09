@@ -1,0 +1,14 @@
+Source: orvant-snitch
+Section: net
+Priority: optional
+Maintainer: Orvant Maintainers <dev@orvant.com>
+Homepage: http://www.orvant.com
+
+Package: orvant-snitch
+Architecture: all
+Depends: python (>= 2.6), python-nfqueue
+Recommends: iptables
+Description: outbound firewall at the executable program level
+ Log outbound network activity for executables.  Optionally restrict
+ outbound connections for an executable by destination addess, port,
+ or protocol.
