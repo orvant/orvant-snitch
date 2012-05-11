@@ -1,6 +1,75 @@
-The Debian Package orvant-snitch
---------------------------------
 
-???
+Description
+---------------------------------------------------------------------
 
- -- Orvant Maintainers <dev@orvant.com>  Tue, 19 Apr 2011 17:12:11 -0700
+ov-snitch is an outbound firewall utility that will log which
+destination hosts & ports each process is connecting to.  Instead of
+logging the process ID, which is not particularly useful for most
+cases, the program name will be logged.  Some ways this information
+can be useful:
+
+  * Identify programs that leak potentially sensitive information.
+    Some programs may be more nefarious than others.  Whatever the
+    motives of the program, users should be able to control which
+    information leaves their systems.
+
+  * Disable peer-to-peer (P2P) functionality.  Some programs may use
+    P2P communication as a way to provide services while falling back
+    to a more traditional client-server approach if there are no
+    available peers.  P2P communication could provide better
+    performance, but the cost is at greater exposure to the security
+    of your system.
+
+
+Planned Enhancements
+---------------------------------------------------------------------
+
+In future versions of ov-snitch, users will be able to define rules to
+deny specific programs from communicating to specific hosts and/or
+ports.  Even this solution is sub-optimal as it will still allow
+programs to communicate out until explicitly denied.  Eventually,
+ov-snitch will be able to block the program's network connectivity
+while prompting & waiting for the user to allow or deny the traffic.
+
+
+Setup: iptables
+---------------------------------------------------------------------
+
+In order for ov-snitch to log the traffic for a program, packets will
+need to be sent to a user-space queue for processing.  To send all
+packets for new connections to ov-snitch for processing:
+
+  iptables -A OUTPUT -m state --state NEW -j NFQUEUE
+
+You might not want to send all new connections to user space for
+processing.  With iptables, there is most likely a way to meet your
+specific needs and only have ov-snitch process the desired packets.
+
+
+Setup: syslog
+---------------------------------------------------------------------
+
+ov-snitch will log the following fields, separated by '|', to syslog
+using a process name of 'ov-snitch':
+
+  <protocol number> | <dst> | <dst port> | <src> | <src port> | <program name>
+
+
+Credit
+---------------------------------------------------------------------
+
+The development of ov-snitch was inspired by the Little Snitch
+application for OS X.
+
+There is already a similar & more complete implementation for Linux
+called Leopard Firewall (lpfw).
+
+Thanks to the nfqueue & scapy libraries, without which would make this
+considerable more work.
+
+
+Copyright
+---------------------------------------------------------------------
+
+Copyright (C) 2012 Orvant, Inc. <dev@orvant.com>.  All rights
+reserved.  Please refer to the copyright file for more details.

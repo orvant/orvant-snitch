@@ -1,17 +1,7 @@
 #! /usr/bin/env python
 """
-An outbound firewall.  Inspired by the Little Snitch application for
-OS X.  Will log all outbound packets and will reject any packets that
-match any user-defined deny rules.
-
-For a more complete implementation with a better frontend, check out
-Leopard Firewall (lpfw).  Props to him/her/them for showing the
-technique of how to map packets to programs.
-
-NOTE: This program will only process packets that have been queued to
-user space by iptables.  When defining iptables rules, it is
-recommended to only send packets with state=new to avoid processing
-multiple packets for the same connection.
+Outbound firewall, at executable program level.
+Please refer to the README for more information.
 """
 
 import os, socket, nfqueue, syslog
@@ -29,6 +19,7 @@ def subshell(cmd):
     """
     Return output of given shell command.
     """
+    # No longer used but left around just in case will be useful later.
     from subprocess import Popen, PIPE
     p = Popen(cmd, shell=True, stdout=PIPE, stderr=PIPE)
     p.wait()
@@ -76,7 +67,7 @@ def program(inode):
     """
     if not inode:
         return ''
-    # TODO: I'm worried this glob + readlink approach will be too slow for busier systems.
+    # TODO: Worried this glob + readlink approach will be too slow for busier systems.
     for path in glob('/proc/*/fd/*'):
         # Looking for links of the form: <fileno> -> [socket:<inode>]
         if os.path.exists(path) and inode in os.readlink(path):
@@ -94,7 +85,7 @@ def process_packet(dummy, payload):
     pkt = IP(payload.get_data())
     for i in inode(pkt):
         syslog.syslog(' | '.join(str(i) for i in (pkt.proto, pkt.dst, getattr(pkt, 'dport', ''), pkt.src, getattr(pkt, 'sport', ''), program(i))))
-        # TODO: See if we should reject.
+        # TODO: Consult configured rules to see if we should reject.
 
 
 if __name__ == '__main__':
