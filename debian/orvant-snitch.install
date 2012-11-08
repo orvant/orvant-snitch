@@ -1,1 +1,4 @@
 bin/ov-snitch
+etc/ov-snitch.conf etc
+doc/ov-snitch.1 usr/share/man/man1
+doc/ov-snitch.conf.1 usr/share/man/man5

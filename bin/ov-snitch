@@ -1,32 +1,58 @@
 #! /usr/bin/env python
 """
-Outbound firewall, at executable program level.
-Please refer to the README for more information.
+Log & block packets by executable program.
 """
 
-import os, socket, nfqueue, syslog
+import os, sys, socket, nfqueue, syslog, time, yaml, atexit
+from StringIO import StringIO
+from functools import partial
+from collections import namedtuple
 from glob import glob
-from scapy.all import *
 
-PROTOCOLS = {}
-PROTOCOLS[6]  = 'tcp'
-PROTOCOLS[17] = 'udp'
+import logging, warnings
+logging.getLogger('scapy.runtime').setLevel(logging.ERROR)
+with warnings.catch_warnings():
+    warnings.filterwarnings("ignore", category=DeprecationWarning)
+    from scapy.all import IP, TCP, UDP
 
-snitchable = (6,17).__contains__
+def log(*msgs, **opts):
+    level = opts.get('level', syslog.LOG_INFO)
+    syslog.syslog(level, ' | '.join(str(i) for i in msgs))
+dbg = partial(log, level=syslog.LOG_DEBUG)
+err = partial(log, level=syslog.LOG_ERR)
+
+PROTOCOLS = {6: 'tcp', 17: 'udp'}
+RULES = {}
+
+Pkt = namedtuple('Pkt', 'proto src sport dst dport program inode')
 
 
-def subshell(cmd):
-    """
-    Return output of given shell command.
-    """
-    # No longer used but left around just in case will be useful later.
-    from subprocess import Popen, PIPE
-    p = Popen(cmd, shell=True, stdout=PIPE, stderr=PIPE)
-    p.wait()
-    return p.stdout.read()
+def main():
+    if '-c' in sys.argv:
+        cfg_path = sys.argv[sys.argv.index('-c') + 1]
+    else:
+        cfg_path = '/etc/ov-snitch.conf'
+    if os.path.exists(cfg_path):
+        with open(cfg_path) as f:
+            cfg = yaml.load(f)
+            RULES.update(cfg.get('rules', {}))
+    syslog.openlog('ov-snitch')
+    q = nfqueue.queue()
+    q.set_callback(process_packet)
+    q.fast_open(1, socket.AF_INET)
+    q.create_queue(0) 
+    atexit.register(shutdown, q)
+    log('Listening...')
+    q.try_run()
 
 
-def inode(pkt):
+def shutdown(q):
+    log('Shutting down...')
+    q.unbind(socket.AF_INET)
+    q.close()
+
+
+def inodes(pkt):
     """
     Yield inode number (as str) for any socket associated with given packet.
 
@@ -39,41 +65,70 @@ def inode(pkt):
     # Example from /proc/net/tcp:
     # sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode                                                     
     #  0: 0101010A:0035 00000000:0000 0A 00000000:00000000 00:00000000 00000000   104        0 192852 1 ffff8803e8969a00 300 0 0 2 -1                    
-    if not snitchable(pkt.proto):
+    proto = PROTOCOLS.get(pkt.proto)
+    if proto is None:
+        dbg('Unhandled protocol.', pkt.proto)
         return
-    with open('/proc/net/' + PROTOCOLS[pkt.proto]) as f:
-        pkt = pkt / (TCP() if pkt.proto == 6 else UDP())
+    with open('/proc/net/' + proto) as f:
+        pkt = pkt / (TCP() if proto == 'tcp' else UDP())
         f.readline() # Ignore header line.
-        for line in f.readlines():
-            fields = line.split()
-            if len(fields) < 10:
-                # TODO: How should we log that we've seen a bad line?
-                continue
-            inode = fields[9]
-            dst, dport = fields[2].split(':')
-            src, sport = fields[1].split(':')
-            dport = int(dport, 16)
-            sport = int(sport, 16)
-            # The addresses are in little-endian format.
-            dst = '.'.join(str(int(i, 16)) for i in (dst[6:8], dst[4:6], dst[2:4], dst[:2]))
-            src = '.'.join(str(int(i, 16)) for i in (src[6:8], src[4:6], src[2:4], src[:2]))
-            if dst == pkt.dst and dport == pkt.dport and inode != '0':
-                yield inode
+        for i in matching_inodes(pkt, f):
+            yield i
+
+def matching_inodes(pkt, f):
+    """
+    Yield inode for all matching lines of given stream.
+    """
+    for line in f.readlines():
+        fields = line.split()
+        if len(fields) < 10 or fields[9] in ('', '0'):
+            continue
+        inode = fields[9]
+        remote_addr, remote_port = fields[2].split(':')
+        remote_port = int(remote_port, 16)
+        # The addresses are in little-endian format.
+        remote_addr = "%d.%d.%d.%d" % (
+            int(remote_addr[6:8], 16),
+            int(remote_addr[4:6], 16),
+            int(remote_addr[2:4], 16),
+            int(remote_addr[:2], 16))
+        if ((remote_addr == pkt.dst and remote_port == pkt.dport) or
+            (remote_addr == pkt.src and remote_port == pkt.sport)):
+            yield inode
 
 
 def program(inode):
     """
     Return program name using given inode.
     """
-    if not inode:
-        return ''
     # TODO: Worried this glob + readlink approach will be too slow for busier systems.
-    for path in glob('/proc/*/fd/*'):
+    search = "socket:[" + inode + "]"
+    for path in glob('/proc/[0-9]*/fd/*'):
         # Looking for links of the form: <fileno> -> [socket:<inode>]
-        if os.path.exists(path) and inode in os.readlink(path):
+        if os.path.exists(path) and search == os.readlink(path):
             pid = path.split('/')[2]
             return os.readlink('/proc/%s/exe' % pid)
-    return ''
+    return 'KERNEL'
+
+
+def allowed(pkt, rules):
+    """
+    True if given Pkt is allowed by the given rules.
+
+    Rules map destinations, ports, and programs to more specific
+    rules. The rules are traversed as far as possible.  A packet will
+    be denied if the resulting rule contains deny:true.
+    """
+    if pkt.dst in rules:
+        return allowed(pkt, rules[pkt.dst])
+    elif pkt.src in rules:
+        return allowed(pkt, rules[pkt.src])
+    elif pkt.dport in rules:
+        return allowed(pkt, rules[pkt.dport])
+    elif pkt.program in rules:
+        return allowed(pkt, rules[pkt.program])
+    else:
+        return not rules.get('deny', False)
 
 
 def process_packet(dummy, payload):
@@ -82,21 +137,72 @@ def process_packet(dummy, payload):
     If (program and/or dst and/or dport) matches any reject rules,
     then reject the packet.  Otherwise, packet is accepted.
     """
+    start = time.time()
     pkt = IP(payload.get_data())
-    for i in inode(pkt):
-        syslog.syslog(' | '.join(str(i) for i in (pkt.proto, pkt.dst, getattr(pkt, 'dport', ''), pkt.src, getattr(pkt, 'sport', ''), program(i))))
-        # TODO: Consult configured rules to see if we should reject.
+    for i in inodes(pkt):
+        pkt = Pkt(PROTOCOLS[pkt.proto],
+                  pkt.src, getattr(pkt, 'sport', None),
+                  pkt.dst, getattr(pkt, 'dport', None),
+                  program(i), i)
+        if allowed(pkt, RULES):
+            payload.set_verdict(nfqueue.NF_ACCEPT)
+            verdict = 'allowed'
+        else:
+            payload.set_verdict(nfqueue.NF_DROP)
+            verdict = 'denied'
+        log(verdict, int((time.time() - start) * 1000), *pkt)
+
+
+def help():
+    print __doc__
+    print '  usage: ov-snitch [-th] [-c /cfg/file]'
+
+
+def test():
+    # Inbound address based rules
+    pkt = Pkt('tcp', '1.1.1.1', 48739, '127.0.0.1', 43253, '/bin/nc', '13976')
+    assert allowed(pkt, {'1.1.1.1': {}}) is True
+    assert allowed(pkt, {'1.1.1.1': {'deny': True}}) is False
+    assert allowed(pkt, {'1.1.1.1': {'/bin/nc': {}, 'deny': True}}) is True
+    assert allowed(pkt, {'1.1.1.1': {'/bin/nc': {43253: {}, 'deny': True}, 'deny': True}}) is True
+    assert allowed(pkt, {'1.1.1.1': {'/bin/nc': {43255: {}, 'deny': True}, 'deny': True}}) is False
+
+    # Outbound address based rules
+    pkt = Pkt('tcp', '127.0.0.1', 43253, '1.1.1.1', 80, '/usr/bin/curl', '13976')
+    assert allowed(pkt, {'1.1.1.1': {}}) is True
+    assert allowed(pkt, {'1.1.1.1': {'deny': True}}) is False
+    assert allowed(pkt, {'1.1.1.1': {'/usr/bin/curl': {}, 'deny': True}}) is True
+    assert allowed(pkt, {'1.1.1.1': {'/usr/bin/curl': {80: {}, 'deny': True}, 'deny': True}}) is True
+    assert allowed(pkt, {'1.1.1.1': {'/usr/bin/curl': {81: {}, 'deny': True}, 'deny': True}}) is False
+
+    # Port based rules
+    assert allowed(pkt, {80: {}}) is True
+    assert allowed(pkt, {80: {'deny': True}}) is False
+    assert allowed(pkt, {'80': {'deny': True}}) is True
+    assert allowed(pkt, {80: {'1.1.1.1': {}, 'deny': True}, 'deny': True}) is True
+    assert allowed(pkt, {80: {'1.1.1.1': {'/usr/bin/curl': {}, 'deny': True}, 'deny': True}, 'deny': True}) is True
+    assert allowed(pkt, {80: {'1.1.1.1': {'/bin/curl': {}, 'deny': True}, 'deny': True}, 'deny': True}) is False
+
+    # Program based rules
+    assert allowed(pkt, {'/usr/bin/curl': {}}) is True
+    assert allowed(pkt, {'/usr/bin/curl': {'deny': True}}) is False
+    assert allowed(pkt, {'/usr/bin/curl': {80: {}, 'deny': True}}) is True
+    assert allowed(pkt, {'/usr/bin/curl': {80: {'1.1.1.1': {}, 'deny': True}, 'deny': True}}) is True
+    assert allowed(pkt, {'/usr/bin/curl': {80: {'1.1.1.2': {}, 'deny': True}, 'deny': True}}) is False
+
+    # Packet to inode mapping from /proc files
+    pkt = Pkt('tcp', '1.1.1.2', 43253, '1.222.33.14', 80, '/usr/bin/curl', '13976')
+    assert ['123'] == list(matching_inodes(pkt, StringIO('97: 00000000:0000 0E21DE01:0050 07 00000000:00000000 00:00000000 00000000   104        0 123 2 ffff8803e96723c0 0')))
+    assert      [] == list(matching_inodes(pkt, StringIO('97: 00000000:0000 0E21DE01:0050 07 00000000:00000000 00:00000000 00000000   104        0 ')))
+    assert      [] == list(matching_inodes(pkt, StringIO('97: 00000000:0000 0E21DE01:0050 07 00000000:00000000 00:00000000 00000000   104        0')))
+
+    print 'ALL TESTS PASSED'
 
 
 if __name__ == '__main__':
-    syslog.openlog('ov-snitch')
-    q = nfqueue.queue()
-    q.set_callback(process_packet)
-    q.fast_open(1, socket.AF_INET)
-    q.create_queue(0) 
-    try:
-        q.try_run()
-    except KeyboardInterrupt:
-        print "Exiting..." 
-    q.unbind(socket.AF_INET)
-    q.close()
+    if '-h' in sys.argv:
+        help()
+    elif '-t' in sys.argv:
+        test()
+    else:
+        main()
