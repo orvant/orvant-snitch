@@ -33,3 +33,10 @@ nosetests.xml
 .mr.developer.cfg
 .project
 .pydevproject
+
+# /debian/
+/debian/*.debhelper
+/debian/*.debhelper.log
+/debian/*.substvars
+/debian/files
+/debian/orvant-snitch
