@@ -1,6 +1,6 @@
 # ov-snitch
 
-Application level packet logging & filtering.
+Log & block packets by executable program name, destination, and/or port.
 
 [DESCRIPTION](#DESCRIPTION)  
 [OPTIONS](#OPTIONS)  
@@ -100,8 +100,5 @@ this program would be considerably more complex.
 
 ## COPYRIGHT
 
-Copyright (C) 2012 Orvant, Inc. <dev@orvant.com\>. All rights
+Copyright (C) 2012-2013 Orvant, Inc. <dev@orvant.com\>. All rights
 reserved. Please refer to the copyright file for more details.
-
-
-

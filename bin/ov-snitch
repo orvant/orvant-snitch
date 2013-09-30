@@ -1,15 +1,22 @@
 #! /usr/bin/env python
 """
-Log & block packets by executable program.
+Log & block packets by executable program name, destination, and/or port.
 """
 
-import os, sys, socket, nfqueue, syslog, time, yaml, atexit
-from StringIO import StringIO
+import os
+import sys
+import socket
+import nfqueue
+import syslog
+import time
+import yaml
+import atexit
 from functools import partial
 from collections import namedtuple
 from glob import glob
 
-import logging, warnings
+import logging
+import warnings
 logging.getLogger('scapy.runtime').setLevel(logging.ERROR)
 with warnings.catch_warnings():
     warnings.filterwarnings("ignore", category=DeprecationWarning)
@@ -66,45 +73,35 @@ def inodes(pkt):
     """
     Yield inode number (as str) for any socket associated with given packet.
 
-    NOTE: Only works for TCP or UDP packets.
+      `pkt`: a scapy TCP or UDP packet
     """
-    # Example from /proc/net/udp:
-    # sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops             
-    # 97: 0101010A:0035 00000000:0000 07 00000000:00000000 00:00000000 00000000   104        0 192851 2 ffff8803e96723c0 0
-    #
-    # Example from /proc/net/tcp:
-    # sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode                                                     
-    #  0: 0101010A:0035 00000000:0000 0A 00000000:00000000 00:00000000 00000000   104        0 192852 1 ffff8803e8969a00 300 0 0 2 -1                    
-    proto = PROTOCOLS.get(pkt.proto)
-    if proto is None:
-        dbg('Unhandled protocol.', pkt.proto)
-        return
+    proto = PROTOCOLS[pkt.proto]
     with open('/proc/net/' + proto) as f:
-        pkt = pkt / (TCP() if proto == 'tcp' else UDP())
         f.readline() # Ignore header line.
-        for i in matching_inodes(pkt, f):
-            yield i
+        for line in f.readlines():
+            inode = matched_inode(pkt, line)
+            if inode is not None:
+                yield inode
 
-def matching_inodes(pkt, f):
+def matched_inode(pkt, line):
     """
-    Yield inode for all matching lines of given stream.
+    Return inode if `pkt` matches given `line`.  Otherwise, None.
     """
-    for line in f.readlines():
-        fields = line.split()
-        if len(fields) < 10 or fields[9] in ('', '0'):
-            continue
-        inode = fields[9]
-        remote_addr, remote_port = fields[2].split(':')
-        remote_port = int(remote_port, 16)
-        # The addresses are in little-endian format.
-        remote_addr = "%d.%d.%d.%d" % (
-            int(remote_addr[6:8], 16),
-            int(remote_addr[4:6], 16),
-            int(remote_addr[2:4], 16),
-            int(remote_addr[:2], 16))
-        if ((remote_addr == pkt.dst and remote_port == pkt.dport) or
-            (remote_addr == pkt.src and remote_port == pkt.sport)):
-            yield inode
+    fields = line.split()
+    if len(fields) < 10 or fields[9] in ('', '0'):
+        return
+
+    inode = fields[9]
+    remote_addr, remote_port = fields[2].split(':')
+    remote_port = int(remote_port, 16)
+    remote_addr = "%d.%d.%d.%d" % ( # The addresses are in little-endian format.
+        int(remote_addr[6:8], 16),
+        int(remote_addr[4:6], 16),
+        int(remote_addr[2:4], 16),
+        int(remote_addr[:2], 16))
+    if ((remote_addr == pkt.dst and remote_port == pkt.dport) or
+        (remote_addr == pkt.src and remote_port == pkt.sport)):
+        return inode
 
 
 def program(inode):
@@ -141,20 +138,26 @@ def allowed(pkt, rules):
         return not rules.get('deny', False)
 
 
-def process_packet(dummy, payload):
+def process_packet(payload):
     """
     Log packet's protocol, dst, dport, src, sport, & program via syslog.
     If (program and/or dst and/or dport) matches any reject rules,
     then reject the packet.  Otherwise, packet is accepted.
     """
+    ip = IP(payload.get_data())
+    if not ip.haslayer(TCP) and not ip.haslayer(UDP):
+        payload.set_verdict(nfqueue.NF_ACCEPT)
+        return
+        
     start = time.time()
-    pkt = IP(payload.get_data())
-    for i in inodes(pkt):
-        pkt = Pkt(PROTOCOLS[pkt.proto],
-                  pkt.src, getattr(pkt, 'sport', None),
-                  pkt.dst, getattr(pkt, 'dport', None),
-                  program(i), i)
-        if allowed(pkt, RULES):
+    for inode in inodes(ip):
+        pkt = Pkt(
+            PROTOCOLS[ip.proto],
+            ip.src, getattr(ip, 'sport', None),
+            ip.dst, getattr(ip, 'dport', None),
+            program(inode), inode,
+        )
+        if allowed(pkt, cfg.rules):
             payload.set_verdict(nfqueue.NF_ACCEPT)
             verdict = 'allowed'
         else:
@@ -201,12 +204,20 @@ def test():
     assert allowed(pkt, {'/usr/bin/curl': {80: {'1.1.1.2': {}, 'deny': True}, 'deny': True}}) is False
 
     # Packet to inode mapping from /proc files
+    #
+    # Example from /proc/net/udp:
+    # sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops
+    # 97: 0101010A:0035 00000000:0000 07 00000000:00000000 00:00000000 00000000   104        0 192851 2 ffff8803e96723c0 0
+    #
+    # Example from /proc/net/tcp:
+    # sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+    #  0: 0101010A:0035 00000000:0000 0A 00000000:00000000 00:00000000 00000000   104        0 192852 1 ffff8803e8969a00 300 0 0 2 -1
     pkt = Pkt('tcp', '1.1.1.2', 43253, '1.222.33.14', 80, '/usr/bin/curl', '13976')
-    assert ['123'] == list(matching_inodes(pkt, StringIO('97: 00000000:0000 0E21DE01:0050 07 00000000:00000000 00:00000000 00000000   104        0 123 2 ffff8803e96723c0 0')))
-    assert      [] == list(matching_inodes(pkt, StringIO('97: 00000000:0000 0E21DE01:0050 07 00000000:00000000 00:00000000 00000000   104        0 ')))
-    assert      [] == list(matching_inodes(pkt, StringIO('97: 00000000:0000 0E21DE01:0050 07 00000000:00000000 00:00000000 00000000   104        0')))
+    assert '123' == matched_inode(pkt, '97: 00000000:0000 0E21DE01:0050 07 00000000:00000000 00:00000000 00000000   104        0 123 2 ffff8803e96723c0 0')
+    assert  None == matched_inode(pkt, '97: 00000000:0000 0E21DE01:0050 07 00000000:00000000 00:00000000 00000000   104        0 ')
+    assert  None == matched_inode(pkt, '97: 00000000:0000 0E21DE01:0050 07 00000000:00000000 00:00000000 00000000   104        0')
 
-    print 'ALL TESTS PASSED'
+    print('ALL TESTS PASSED')
 
 
 if __name__ == '__main__':
