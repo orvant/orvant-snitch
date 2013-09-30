@@ -40,16 +40,14 @@ The options which apply to the **ov-snitch** command are:
 
 * −c : *CFG\_FILE*
 
+* -q : *QUEUE_NUM*
+
 Use the given configuration file. With no configuration, ov-snitch
 will only log packet & program info to syslog. Rules can be defined
 in a config file (-c) to deny packets based on destination
 address, destination port, and executable program name.
 
 ## NOTES
-
-If there is no user-space program such as ov-snitch processing the
-queue, then the packets sent to the netfilter queue will hang and
-eventually timeout.
 
 It is not recommended to have critical traffic go through a
 user-space process such as this. Connectivity could suffer
@@ -63,7 +61,8 @@ In order for ov-snitch to log the traffic for a program, packets
 will need to be sent to a user-space queue for processing. To send
 all packets for new connections to ov-snitch for processing:
 
-iptables -A OUTPUT -m state --state NEW -j NFQUEUE
+iptables -A OUTPUT -m state --state NEW \
+    -j NFQUEUE --queue-bypass --queue-num 0
 
 You might not want to send all new connections to user space for
 processing. With iptables, there is most likely a way to meet your

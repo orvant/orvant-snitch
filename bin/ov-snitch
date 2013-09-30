@@ -22,9 +22,13 @@ dbg = partial(log, level=syslog.LOG_DEBUG)
 err = partial(log, level=syslog.LOG_ERR)
 
 PROTOCOLS = {6: 'tcp', 17: 'udp'}
-RULES = {}
 
 Pkt = namedtuple('Pkt', 'proto src sport dst dport program inode')
+
+
+class cfg:
+    queue = 0
+    rules = {}
 
 
 def main():
@@ -34,13 +38,19 @@ def main():
         cfg_path = '/etc/ov-snitch.conf'
     if os.path.exists(cfg_path):
         with open(cfg_path) as f:
-            cfg = yaml.load(f)
-            RULES.update(cfg.get('rules', {}))
+            d = yaml.load(f)
+            if 'rules' in d:
+                cfg.rules.update(d['rules'])
+            if 'queue' in d:
+                cfg.queue = d['queue']
+
+    if '-q' in sys.argv:
+        cfg.queue = int(sys.argv[sys.argv.index('-q') + 1])
+
     syslog.openlog('ov-snitch')
     q = nfqueue.queue()
     q.set_callback(process_packet)
-    q.fast_open(1, socket.AF_INET)
-    q.create_queue(0) 
+    q.fast_open(cfg.queue, socket.AF_INET)
     atexit.register(shutdown, q)
     log('Listening...')
     q.try_run()
@@ -154,8 +164,8 @@ def process_packet(dummy, payload):
 
 
 def help():
-    print __doc__
-    print '  usage: ov-snitch [-th] [-c /cfg/file]'
+    print(__doc__)
+    print('  usage: ov-snitch [-th] [-c /cfg/file] [-q nfqueue-num]')
 
 
 def test():
